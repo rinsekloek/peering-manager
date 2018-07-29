@@ -18,7 +18,7 @@ from .constants import (BGP_STATE_CHOICES, BGP_STATE_IDLE, BGP_STATE_CONNECT,
                         BGP_STATE_OPENCONFIRM, BGP_STATE_ESTABLISHED,
                         COMMUNITY_TYPE_CHOICES, COMMUNITY_TYPE_EGRESS,
                         COMMUNITY_TYPE_INGRESS, PLATFORM_CHOICES,
-                        PLATFORM_JUNOS, PLATFORM_IOSXR, PLATFORM_EOS)
+                        PLATFORM_JUNOS, PLATFORM_IOSXR, PLATFORM_EOS, PLATFORM_IOS)
 from .fields import ASNField, CommunityField
 from peeringdb.api import PeeringDB
 from peeringdb.models import NetworkIXLAN, PeerRecord
@@ -457,6 +457,7 @@ class InternetExchange(models.Model):
         log = 'ignoring session states on {}, reason: "{}"'
         if not self.router:
             log = log.format(self.name.lower(), 'no router attached')
+        
         elif not self.router.can_napalm_get_bgp_neighbors_detail():
             log = log.format(self.name.lower(),
                              'router with unsupported platform {}'.format(
@@ -470,40 +471,77 @@ class InternetExchange(models.Model):
         if log:
             self.logger.debug(log)
             return False
+        
+        # Get all BGP sessions detail with napalm_bgp_neighbors
+        # Made a custom for IOS
+        if self.router.platform == 'ios':
+            bgp_neighbors = self.router.get_napalm_bgp_neighbors_detail_ios()
+            
+            for peer_ip, peer_values in bgp_neighbors['global']['peers'].items():
+                ip_address = peer_ip
+                self.logger.debug('looking for session %s in %s', ip_address, self.name.lower())
+                
+                # Check if the BGP session is on this IX
+                peering_session = PeeringSession.does_exist(internet_exchange=self, ip_address=ip_address)
+                
+                if peering_session:
+                    # Get the BGP state for the session
+                    if peer_values['is_up']:
+                        state = BGP_STATE_ESTABLISHED
+                    else:
+                        state = BGP_STATE_IDLE
+                       
+                    for family, prefixes_family in peer_values['address_family'].items():
+                        received = prefixes_family['received_prefixes']
+                        advertised = prefixes_family['sent_prefixes']
+                    self.logger.debug(
+                        'found session %s in %s with state %s',
+                        ip_address, self.name.lower(), state)
 
-        # Get all BGP sessions detail
-        bgp_neighbors_detail = self.router.get_napalm_bgp_neighbors_detail()
-        with transaction.atomic():
-            for vrf, as_details in bgp_neighbors_detail.items():
-                for asn, sessions in as_details.items():
-                    # Check BGP sessions found
-                    for session in sessions:
-                        ip_address = session['remote_address']
-                        self.logger.debug(
-                            'looking for session %s in %s', ip_address,
-                            self.name.lower())
+                    # Update the BGP state of the session
+                    peering_session.bgp_state = state
+                    peering_session.received_prefix_count = received
+                    peering_session.advertised_prefix_count = advertised
+                    peering_session.save()
+                    self.logger.debug(peering_session)
+                else:
+                    self.logger.debug('session %s in %s not found', ip_address, self.name.lower())
 
-                        # Check if the BGP session is on this IX
-                        peering_session = PeeringSession.does_exist(
-                            internet_exchange=self, ip_address=ip_address)
-                        if peering_session:
-                            # Get the BGP state for the session
-                            state = session['connection_state'].lower()
-                            received = session['received_prefix_count']
-                            advertised = session['advertised_prefix_count']
+        else:
+            # Get all BGP sessions detail with napalm_bgp_neighbors_detail
+            bgp_neighbors_detail = self.router.get_napalm_bgp_neighbors_detail()
+            
+            with transaction.atomic():
+                for vrf, as_details in bgp_neighbors_detail.items():
+                    for asn, sessions in as_details.items():
+                        # Check BGP sessions found
+                        for session in sessions:
+                            ip_address = session['remote_address']
                             self.logger.debug(
-                                'found session %s in %s with state %s',
-                                ip_address, self.name.lower(), state)
-
-                            # Update the BGP state of the session
-                            peering_session.bgp_state = state
-                            peering_session.received_prefix_count = received
-                            peering_session.advertised_prefix_count = advertised
-                            peering_session.save()
-                        else:
-                            self.logger.debug(
-                                'session %s in %s not found', ip_address,
+                                'looking for session %s in %s', ip_address,
                                 self.name.lower())
+
+                            # Check if the BGP session is on this IX
+                            peering_session = PeeringSession.does_exist(
+                                internet_exchange=self, ip_address=ip_address)
+                            if peering_session:
+                                # Get the BGP state for the session
+                                state = session['connection_state'].lower()
+                                received = session['received_prefix_count']
+                                advertised = session['advertised_prefix_count']
+                                self.logger.debug(
+                                    'found session %s in %s with state %s',
+                                    ip_address, self.name.lower(), state)
+
+                                # Update the BGP state of the session
+                                peering_session.bgp_state = state
+                                peering_session.received_prefix_count = received
+                                peering_session.advertised_prefix_count = advertised
+                                peering_session.save()
+                            else:
+                                self.logger.debug(
+                                    'session %s in %s not found', ip_address,
+                                    self.name.lower())
 
             # Save last session states update
             self.bgp_session_states_update = timezone.now()
@@ -643,7 +681,7 @@ class PeeringSession(models.Model):
             badge, self.get_bgp_state_display() or 'Unknown')
 
         # Only if the session is established, display some details
-        if self.bgp_state == BGP_STATE_ESTABLISHED:
+        if self.bgp_state == BGP_STATE_ESTABLISHED :
             text = '{} {}'.format(
                 text,
                 '<span class="badge badge-primary">Routes: '
@@ -674,10 +712,10 @@ class Router(models.Model):
 
     def get_absolute_url(self):
         return reverse('peering:router_details', kwargs={'pk': self.pk})
-
+        
     def can_napalm_get_bgp_neighbors_detail(self):
         return False if not self.platform else self.platform in [
-            PLATFORM_EOS, PLATFORM_IOSXR, PLATFORM_JUNOS
+            PLATFORM_EOS, PLATFORM_IOSXR, PLATFORM_JUNOS, PLATFORM_IOS
         ]
 
     def get_napalm_device(self):
@@ -869,6 +907,38 @@ class Router(models.Model):
                         continue
 
         return bgp_peers
+        
+    def get_napalm_bgp_neighbors_detail_ios(self):
+        """
+        Returns a list of dictionaries listing all BGP neighbors found on the
+        router using NAPALM and there respective detail.
+
+        If an error occurs or no BGP neighbors can be found, the returned list
+        will be empty.
+        """
+        bgp_sessions = []
+
+        device = self.get_napalm_device()
+        opened = self.open_napalm_device(device)
+
+        if opened:
+            # Get all BGP neighbors on the router
+            self.logger.debug('getting bgp neighbors on %s', self.hostname)
+            bgp_neighbors = device.get_bgp_neighbors()
+            self.logger.debug('raw napalm output %s', bgp_neighbors)
+            self.logger.debug('found %s vrfs with bgp neighbors on %s', len(
+                bgp_neighbors), self.hostname)
+
+            self.logger.debug('found %s bgp neighbors on %s',
+                              len(bgp_sessions), self.hostname)
+
+            # Close connection to the device
+            closed = self.close_napalm_device(device)
+            if not closed:
+                self.logger.debug(
+                    'error while closing connection with %s', self.hostname)
+
+        return bgp_neighbors
 
     def get_napalm_bgp_neighbors(self):
         """
